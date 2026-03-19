@@ -37,7 +37,7 @@ Phase 1: Infrastructure                    Phase 2: Pipeline
 │  metadata/manifest.json │  Notification  │                          │
 └─────────────────────────┘                │  1. Download from S3     │
                                            │  2. Detect document type │
-┌─────────────────────────┐                │  3. Extract metadata     │
+┌──────────────────────────┐               │  3. Extract metadata     │
 │  OpenSearch Serverless   │◄──chunks──────│  4. Semantic chunk       │
 │  legal-research-vectors  │               │     (~500 tokens, 2-sent │
 │                          │               │      overlap)            │
@@ -46,14 +46,14 @@ Phase 1: Infrastructure                    Phase 2: Pipeline
 │  │ ML Connector       │  │               │      auto-embeds)        │
 │  │ → Bedrock Titan V2 │  │               │  6. Write DynamoDB       │
 │  │ → 1024d embeddings │  │               └──────────┬───────────────┘
-│  └────────────────────┘  │                           │
-│                          │               ┌───────────▼──────────────┐
-│  Hybrid Search Pipeline  │               │  DynamoDB                │
-│  (configurable weights)  │               │  LegalDocMetadata        │
-│  Default: 70% semantic   │               │  PK: document_id         │
-│           30% keyword    │               │  SK: chunk_id            │
-└─────────────────────────┘               │  GSI: type, status       │
-                                           └──────────────────────────┘
+│  └────────────────────┘  │                          │
+│                          │               ┌──────────▼──────────────┐
+│  Hybrid Search Pipeline  │               │  DynamoDB               │
+│  (configurable weights)  │               │  LegalDocMtadata        │
+│  Default: 70% semantic   │               │  PK: documnt_id         │
+│           30% keyword    │               │  SK: chunkid            │
+└──────────────────────────┘               │  GSI: type status       │
+                                           └─────────────────────────┘
 Phase 3: Query
 ┌─────────────────────────────────────────────────────────────────┐
 │  search_and_rag.py                                              │
@@ -138,8 +138,11 @@ uv run scripts/search_and_rag.py --query "SLA breach remedies in cloud contracts
 # RAG only — retrieve context, generate answer with Claude
 uv run scripts/search_and_rag.py -q "What constitutes material breach?" -m rag
 
-# Retrieve with metadata filter
-uv run scripts/search_and_rag.py -q "privacy obligations" -m retrieve --filter case_law
+# Retrieve with metadata filter (use --list-filters to see valid values)
+uv run scripts/search_and_rag.py -q "data privacy breach obligations" -m retrieve --filter regulatory_memo
+
+# List available document types and topics for filtering
+uv run scripts/search_and_rag.py --list-filters
 
 # Custom hybrid weights (50/50 instead of default 70/30)
 uv run scripts/search_and_rag.py -q "indemnification clauses" --semantic-weight 0.5

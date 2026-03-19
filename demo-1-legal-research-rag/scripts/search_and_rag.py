@@ -92,6 +92,29 @@ def print_divider(title: str) -> None:
     print(f"{'─' * 60}\n")
 
 
+def discover_filter_values(host: str, auth: AWS4Auth) -> dict[str, list[dict]]:
+    """Discover available document_type and topics values via aggregations."""
+    body = {
+        "size": 0,
+        "aggs": {
+            "doc_types": {"terms": {"field": "document_type", "size": 20}},
+            "topics": {"terms": {"field": "topics", "size": 30}},
+        },
+    }
+    resp = requests.post(
+        f"https://{host}/{AOSS_INDEX}/_search",
+        auth=auth,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(body),
+        timeout=30,
+    )
+    result = resp.json()
+    return {
+        "document_type": result.get("aggregations", {}).get("doc_types", {}).get("buckets", []),
+        "topics": result.get("aggregations", {}).get("topics", {}).get("buckets", []),
+    }
+
+
 # ─── Mode 1: Hybrid Search (Direct OpenSearch) ──────────────────────────────
 
 
@@ -384,15 +407,18 @@ def retrieve_and_generate(
 
 SAMPLE_QUERIES = [
     "What are the legal implications of SLA violations in cloud service contracts?",
-    "How do courts handle intellectual property disputes in software licensing?",
-    "What constitutes material breach in technology service agreements?",
-    "What are the privacy obligations under data protection regulations?",
-    "How are non-compete clauses enforced in employment contracts?",
+    "How do courts handle data privacy breaches under CPRA and GDPR?",
+    "What constitutes material breach in SaaS subscription agreements?",
+    "What are the indemnification obligations in technology service contracts?",
+    "How are cybersecurity incident response requirements defined in regulatory guidance?",
 ]
 
 
 def interactive_mode(host: str, auth: AWS4Auth, model_id: str) -> None:
     """Run interactive query loop with sample queries."""
+    # Discover what's in the index
+    filters = discover_filter_values(host, auth)
+
     print("\n╔══════════════════════════════════════════════════════════════╗")
     print("║  Legal Research RAG — Interactive Search & Generation       ║")
     print("╠══════════════════════════════════════════════════════════════╣")
@@ -400,6 +426,15 @@ def interactive_mode(host: str, auth: AWS4Auth, model_id: str) -> None:
     print(f"║  Index: {AOSS_INDEX:<42}       ║")
     print(f"║  LLM: {BEDROCK_MODEL_ID:<44}       ║")
     print("╚══════════════════════════════════════════════════════════════╝")
+
+    # Show available filters
+    print("\nDocument types in index:")
+    for b in filters["document_type"]:
+        print(f"  • {b['key']} ({b['doc_count']} chunks)")
+    print("\nTopics in index:")
+    for b in filters["topics"]:
+        print(f"  • {b['key']} ({b['doc_count']} chunks)")
+
     print("\nSample queries:")
     for i, q in enumerate(SAMPLE_QUERIES, 1):
         print(f"  [{i}] {q}")
@@ -452,12 +487,13 @@ def main() -> None:
     )
     parser.add_argument("--query", "-q", help="Search query (omit for interactive mode)")
     parser.add_argument("--mode", "-m", choices=["hybrid", "retrieve", "rag", "all"], default="all")
-    parser.add_argument("--filter", "-f", help="Filter by document_type (for retrieve mode)")
+    parser.add_argument("--filter", "-f", help="Filter by document_type (for retrieve mode). Use --list-filters to see valid values.")
     parser.add_argument("--top-k", "-k", type=int, default=5, help="Number of results (default: 5)")
     parser.add_argument(
         "--semantic-weight", "-w", type=float, default=0.7,
         help="Semantic weight for hybrid search (default: 0.7, keyword = 1 - weight)",
     )
+    parser.add_argument("--list-filters", action="store_true", help="Show available document_type and topics values, then exit")
     args = parser.parse_args()
 
     # Connect to OpenSearch
@@ -478,6 +514,27 @@ def main() -> None:
     if doc_count == 0:
         print("\n⚠️  No documents in index. Run setup-aws-infra.sh first to ingest documents.")
         sys.exit(1)
+
+    # --list-filters: show available values and exit
+    if args.list_filters:
+        filters = discover_filter_values(host, auth)
+        print("\nAvailable document_type values (use with --filter):")
+        for b in filters["document_type"]:
+            print(f"  {b['key']:25s} ({b['doc_count']} chunks)")
+        print("\nAvailable topics values:")
+        for b in filters["topics"]:
+            print(f"  {b['key']:25s} ({b['doc_count']} chunks)")
+        return
+
+    # Validate --filter value if provided
+    if args.filter and args.query:
+        filters = discover_filter_values(host, auth)
+        valid_types = {b["key"] for b in filters["document_type"]}
+        if args.filter not in valid_types:
+            print(f"\n⚠️  Unknown document_type: '{args.filter}'")
+            print(f"   Valid values: {', '.join(sorted(valid_types))}")
+            print("   Use --list-filters to see all available values.")
+            sys.exit(1)
 
     if not args.query:
         interactive_mode(host, auth, model_id)

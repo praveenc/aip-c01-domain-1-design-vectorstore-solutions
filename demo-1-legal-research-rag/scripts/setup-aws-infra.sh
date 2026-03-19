@@ -27,9 +27,10 @@ AWS_REGION="${AWS_REGION:-us-west-2}"
 AWS_PROFILE="${AWS_PROFILE:-001}"
 export AWS_PROFILE
 AWS_ACCOUNT_ID=""  # Populated at runtime via STS
+AOSS_COLLECTION_ID=""  # Populated at runtime after collection is created
 
 # S3
-BUCKET_NAME="demo-1-legal-research-rag-pdx"
+BUCKET_NAME="${BUCKET_NAME:-demo-1-legal-research-rag-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo 'unknown')-${AWS_REGION}}"
 
 # OpenSearch Serverless
 AOSS_COLLECTION_NAME="legal-research-vectors"
@@ -58,6 +59,7 @@ TAG_DEMO="legal-research-rag"
 # Runtime flags
 DRY_RUN=false
 CLEANUP=false
+PYTHON="python3"  # Upgraded to venv python in check_prerequisites
 
 # Counters
 CREATED=0
@@ -150,6 +152,22 @@ check_prerequisites() {
     fi
     success "Python3 installed: $(python3 --version 2>&1)"
 
+    # ── Bootstrap project-local venv for AOSS SigV4 dependencies ──
+    local venv_dir="${SCRIPT_DIR}/.venv"
+    if [[ -f "${venv_dir}/bin/python3" ]] && "${venv_dir}/bin/python3" -c "import requests_aws4auth" 2>/dev/null; then
+        success "Python venv ready (${venv_dir})"
+    else
+        info "Setting up Python venv for AOSS dependencies..."
+        if ! command -v uv &>/dev/null; then
+            error "uv not found. Install: https://docs.astral.sh/uv/getting-started/installation/"
+            exit 1
+        fi
+        uv venv "${venv_dir}" --quiet 2>/dev/null
+        uv pip install --quiet -r "${SCRIPT_DIR}/requirements.txt" -p "${venv_dir}/bin/python3" 2>/dev/null
+        success "Python venv created with dependencies (${venv_dir})"
+    fi
+    PYTHON="${venv_dir}/bin/python3"
+
     if ! command -v zip &>/dev/null; then
         error "zip not found. Required for Lambda packaging."
         exit 1
@@ -168,9 +186,9 @@ check_prerequisites() {
         error "AWS credentials not configured or expired."
         exit 1
     fi
-    AWS_ACCOUNT_ID="$(echo "${sts_output}" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")"
+    AWS_ACCOUNT_ID="$(echo "${sts_output}" | ${PYTHON} -c "import sys,json; print(json.load(sys.stdin)['Account'])")"
     local caller_arn
-    caller_arn="$(echo "${sts_output}" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")"
+    caller_arn="$(echo "${sts_output}" | ${PYTHON} -c "import sys,json; print(json.load(sys.stdin)['Arn'])")"
     success "AWS credentials valid — Account: ${AWS_ACCOUNT_ID}"
     info "Caller: ${caller_arn}"
     info "Region: ${AWS_REGION}"
@@ -186,7 +204,7 @@ ensure_synth_data() {
 
     if [[ -f "${manifest}" ]]; then
         local doc_count
-        doc_count="$(python3 -c "import json; print(len(json.load(open('${manifest}'))))")"
+        doc_count="$(${PYTHON} -c "import json; print(len(json.load(open('${manifest}'))))")"
         success "Synthetic data already exists (${doc_count} documents)"
         return 0
     fi
@@ -271,31 +289,81 @@ create_s3_bucket() {
 # PHASE 1, STEP 2: UPLOAD DOCUMENTS TO S3
 # ═══════════════════════════════════════════════════════════════════════════════
 upload_documents() {
-    step "2" "Upload legal documents to S3"
+    step "8" "Upload legal documents to S3 (triggers Lambda for each doc)"
 
     local data_dir="${DEMO_DIR}/synth_data/output"
 
     if ${DRY_RUN}; then
         dryrun "Upload 30 legal documents to s3://${BUCKET_NAME}/raw-docs/"
         dryrun "Upload manifest.json to s3://${BUCKET_NAME}/metadata/"
+        dryrun "Each upload triggers Lambda → chunks → OpenSearch (neural embeddings) + DynamoDB"
         return 0
     fi
 
+    # Upload manifest first (not in raw-docs/, won't trigger Lambda)
+    info "Uploading manifest..."
+    aws s3 cp "${data_dir}/manifest.json" "s3://${BUCKET_NAME}/metadata/manifest.json" \
+        --region "${AWS_REGION}" --no-cli-pager --quiet
+    success "Uploaded manifest.json to metadata/"
+
+    # Upload documents one by one — each triggers S3 → Lambda → OpenSearch + DynamoDB
     info "Uploading documents to s3://${BUCKET_NAME}/raw-docs/..."
+    info "Each upload triggers: S3 → Lambda → chunk → OpenSearch (neural embed) + DynamoDB"
+    echo ""
     local count=0
+    local total
+    total="$(ls -1 "${data_dir}"/*.txt 2>/dev/null | wc -l | tr -d ' ')"
     for f in "${data_dir}"/*.txt; do
         local filename
         filename="$(basename "${f}")"
         aws s3 cp "${f}" "s3://${BUCKET_NAME}/raw-docs/${filename}" \
             --region "${AWS_REGION}" --no-cli-pager --quiet
         ((count++)) || true
+        printf "\r  📄 Uploaded %d/%d: %s" "${count}" "${total}" "${filename}"
     done
-    success "Uploaded ${count} documents to raw-docs/"
+    echo ""
+    success "Uploaded ${count} documents — Lambda processing in progress..."
 
-    info "Uploading manifest..."
-    aws s3 cp "${data_dir}/manifest.json" "s3://${BUCKET_NAME}/metadata/manifest.json" \
-        --region "${AWS_REGION}" --no-cli-pager --quiet
-    success "Uploaded manifest.json to metadata/"
+    # Give Lambda time to process (each doc takes ~5-15s for chunking + OpenSearch indexing)
+    info "Waiting 60s for Lambda to process all documents..."
+    local elapsed=0
+    while [[ ${elapsed} -lt 60 ]]; do
+        sleep 10
+        ((elapsed += 10)) || true
+        # Check DynamoDB item count as progress indicator
+        local ddb_count
+        ddb_count="$(aws dynamodb scan --table-name "${DYNAMODB_TABLE_NAME}" \
+            --region "${AWS_REGION}" --select COUNT --no-cli-pager \
+            --query Count --output text 2>/dev/null || echo "?")"
+        printf "\r  ⏳ Processing... DynamoDB items: %s (%ds elapsed)" "${ddb_count}" "${elapsed}"
+    done
+    echo ""
+
+    # Final verification
+    local final_ddb_count
+    final_ddb_count="$(aws dynamodb scan --table-name "${DYNAMODB_TABLE_NAME}" \
+        --region "${AWS_REGION}" --select COUNT --no-cli-pager \
+        --query Count --output text 2>/dev/null || echo "0")"
+
+    local final_index_count
+    final_index_count="$(${PYTHON} -c "
+import os, boto3, requests, json
+from requests_aws4auth import AWS4Auth
+session = boto3.Session()
+creds = session.get_credentials().get_frozen_credentials()
+auth = AWS4Auth(creds.access_key, creds.secret_key, '${AWS_REGION}', 'aoss', session_token=creds.token)
+host = 'https://${AOSS_COLLECTION_ID:-unknown}.${AWS_REGION}.aoss.amazonaws.com'
+try:
+    resp = requests.post(f'{host}/${AOSS_INDEX_NAME}/_count', auth=auth, timeout=15)
+    print(resp.json().get('count', '?'))
+except: print('?')
+" 2>/dev/null || echo "?")"
+
+    success "Ingestion status: ${final_ddb_count} DynamoDB items, ${final_index_count} index docs"
+
+    if [[ "${final_ddb_count}" == "0" ]]; then
+        warn "No items in DynamoDB — Lambda may have failed. Check CloudWatch: /aws/lambda/${LAMBDA_FUNCTION_NAME}"
+    fi
 
     ((CREATED++)) || true
 }
@@ -324,6 +392,7 @@ create_opensearch_serverless() {
         --no-cli-pager 2>/dev/null || echo "")"
 
     if [[ -n "${existing_id}" && "${existing_id}" != "None" ]]; then
+        AOSS_COLLECTION_ID="${existing_id}"
         skip "OpenSearch Serverless collection ${AOSS_COLLECTION_NAME} already exists (ID: ${existing_id})"
         ((SKIPPED++)) || true
         return 0
@@ -403,7 +472,7 @@ create_opensearch_serverless() {
         aws opensearchserverless create-access-policy \
             --name "${dap_name}" \
             --type data \
-            --policy "[{\"Rules\":[{\"ResourceType\":\"index\",\"Resource\":[\"index/${AOSS_COLLECTION_NAME}/*\"],\"Permission\":[\"aoss:CreateIndex\",\"aoss:UpdateIndex\",\"aoss:DescribeIndex\",\"aoss:ReadDocument\",\"aoss:WriteDocument\"]},{\"ResourceType\":\"collection\",\"Resource\":[\"collection/${AOSS_COLLECTION_NAME}\"],\"Permission\":[\"aoss:CreateCollectionItems\",\"aoss:DescribeCollectionItems\",\"aoss:UpdateCollectionItems\"]}],\"Principal\":[\"${principal_arn}\",\"${lambda_role_arn}\"]}]" \
+            --policy "[{\"Rules\":[{\"ResourceType\":\"index\",\"Resource\":[\"index/${AOSS_COLLECTION_NAME}/*\"],\"Permission\":[\"aoss:CreateIndex\",\"aoss:UpdateIndex\",\"aoss:DescribeIndex\",\"aoss:ReadDocument\",\"aoss:WriteDocument\"]},{\"ResourceType\":\"collection\",\"Resource\":[\"collection/${AOSS_COLLECTION_NAME}\"],\"Permission\":[\"aoss:CreateCollectionItems\",\"aoss:DescribeCollectionItems\",\"aoss:UpdateCollectionItems\"]},{\"ResourceType\":\"model\",\"Resource\":[\"model/${AOSS_COLLECTION_NAME}/*\"],\"Permission\":[\"aoss:CreateMLResource\",\"aoss:DescribeMLResource\",\"aoss:UpdateMLResource\",\"aoss:DeleteMLResource\",\"aoss:ExecuteMLResource\"]}],\"Principal\":[\"${principal_arn}\",\"${lambda_role_arn}\"]}]" \
             --region "${AWS_REGION}" \
             --no-cli-pager
         success "Data access policy created: ${dap_name}"
@@ -451,6 +520,11 @@ create_opensearch_serverless() {
         endpoint="$(aws opensearchserverless list-collections \
             --region "${AWS_REGION}" \
             --query "collectionSummaries[?name=='${AOSS_COLLECTION_NAME}'].arn" \
+            --output text \
+            --no-cli-pager)"
+        AOSS_COLLECTION_ID="$(aws opensearchserverless list-collections \
+            --region "${AWS_REGION}" \
+            --query "collectionSummaries[?name=='${AOSS_COLLECTION_NAME}'].id" \
             --output text \
             --no-cli-pager)"
         success "Collection is ACTIVE"
@@ -503,7 +577,7 @@ setup_neural_search() {
                 --endpoint-url "https://${aoss_host}" \
                 2>/dev/null || true
             # Use Python + requests-aws4auth for AOSS API calls
-            python3 -c "
+            ${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -521,7 +595,7 @@ if resp.status_code >= 400:
     raise SystemExit(f'HTTP {resp.status_code}: {resp.text}')
 "
         else
-            python3 -c "
+            ${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -542,7 +616,7 @@ if resp.status_code >= 400:
     # ── 3b-1: Check if index already exists ──
     info "Checking if index ${AOSS_INDEX_NAME} already exists..."
     local index_exists=false
-    if python3 -c "
+    if ${PYTHON} -c "
 import boto3, requests
 from requests_aws4auth import AWS4Auth
 session = boto3.Session()
@@ -560,7 +634,7 @@ exit(0 if resp.status_code == 200 else 1)
     # ── 3b-2: Register ML connector to Bedrock Titan Embeddings V2 ──
     info "Creating ML connector to Bedrock Titan Embeddings V2..."
     local connector_response
-    connector_response="$(python3 -c "
+    connector_response="$(${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -601,7 +675,7 @@ if resp.status_code >= 400:
 " 2>&1)"
 
     local connector_id
-    connector_id="$(echo "${connector_response}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('connector_id',''))" 2>/dev/null || echo "")"
+    connector_id="$(echo "${connector_response}" | ${PYTHON} -c "import sys,json; print(json.load(sys.stdin).get('connector_id',''))" 2>/dev/null || echo "")"
 
     if [[ -z "${connector_id}" ]]; then
         warn "ML connector creation response: ${connector_response}"
@@ -615,7 +689,7 @@ if resp.status_code >= 400:
     # ── 3b-3: Register and deploy model ──
     info "Registering ML model..."
     local model_response
-    model_response="$(python3 -c "
+    model_response="$(${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -638,7 +712,7 @@ print(json.dumps(result))
 " 2>&1)"
 
     local model_id
-    model_id="$(echo "${model_response}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('model_id',''))" 2>/dev/null || echo "")"
+    model_id="$(echo "${model_response}" | ${PYTHON} -c "import sys,json; print(json.load(sys.stdin).get('model_id',''))" 2>/dev/null || echo "")"
 
     if [[ -z "${model_id}" ]]; then
         warn "Model registration response: ${model_response}"
@@ -650,7 +724,7 @@ print(json.dumps(result))
 
     # Deploy model (AOSS auto-deploys remote models, but call deploy to be safe)
     info "Deploying ML model..."
-    python3 -c "
+    ${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -669,7 +743,7 @@ print(resp.text)
 
     # ── 3b-4: Create neural ingest pipeline ──
     info "Creating neural ingest pipeline: ${NEURAL_PIPELINE_NAME}..."
-    python3 -c "
+    ${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -700,7 +774,7 @@ if resp.status_code >= 400:
 
     # ── 3b-5: Create hybrid search pipeline ──
     info "Creating hybrid search pipeline: ${HYBRID_PIPELINE_NAME}..."
-    python3 -c "
+    ${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -732,7 +806,7 @@ if resp.status_code >= 400:
 
     # ── 3b-6: Create index with neural pipeline as default ──
     info "Creating index: ${AOSS_INDEX_NAME} with neural ingest pipeline..."
-    python3 -c "
+    ${PYTHON} -c "
 import json, boto3, requests
 from requests_aws4auth import AWS4Auth
 
@@ -860,8 +934,35 @@ create_lambda_iam_role() {
 
     if aws iam get-role --role-name "${LAMBDA_ROLE_NAME}" --no-cli-pager 2>/dev/null; then
         skip "IAM role ${LAMBDA_ROLE_NAME} already exists"
-        # Always update inline policy to ensure permissions are current
-        info "Updating inline policy..."
+        # Always update trust and inline policies to ensure permissions are current
+        info "Updating trust policy and inline policy..."
+        local trust_policy
+        trust_policy=$(cat <<'TRUST_EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "ml.opensearchservice.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+TRUST_EOF
+        )
+        aws iam update-assume-role-policy \
+            --role-name "${LAMBDA_ROLE_NAME}" \
+            --policy-document "${trust_policy}" \
+            --no-cli-pager
     else
         info "Creating IAM role ${LAMBDA_ROLE_NAME}..."
 
@@ -874,6 +975,13 @@ create_lambda_iam_role() {
             "Effect": "Allow",
             "Principal": {
                 "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "ml.opensearchservice.amazonaws.com"
             },
             "Action": "sts:AssumeRole"
         }
@@ -1163,19 +1271,19 @@ EVENT_EOF
     local response_file="/tmp/lambda-test-response.json"
     aws lambda invoke \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
-        --payload "$(echo "${test_event}" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)))")" \
+        --payload "$(echo "${test_event}" | ${PYTHON} -c "import sys,json; print(json.dumps(json.load(sys.stdin)))")" \
         --region "${AWS_REGION}" \
         --no-cli-pager \
         "${response_file}" 2>/dev/null || true
 
     if [[ -f "${response_file}" ]]; then
         local status_code
-        status_code="$(python3 -c "import json; r=json.load(open('${response_file}')); print(r.get('statusCode', 'N/A'))" 2>/dev/null || echo "N/A")"
+        status_code="$(${PYTHON} -c "import json; r=json.load(open('${response_file}')); print(r.get('statusCode', 'N/A'))" 2>/dev/null || echo "N/A")"
 
         if [[ "${status_code}" == "200" ]]; then
             success "Lambda test invocation succeeded (statusCode: 200)"
             local body
-            body="$(python3 -c "import json; r=json.load(open('${response_file}')); print(json.dumps(json.loads(r['body']), indent=2))" 2>/dev/null || echo "{}")"
+            body="$(${PYTHON} -c "import json; r=json.load(open('${response_file}')); print(json.dumps(json.loads(r['body']), indent=2))" 2>/dev/null || echo "{}")"
             info "Response:"
             echo "${body}" | head -20
         else
@@ -1338,18 +1446,33 @@ cleanup() {
     done
     success "OpenSearch Serverless policies deleted"
 
-    # Step 6: Empty and delete S3 bucket
+    # Step 6: Empty and delete S3 bucket (interactive — bucket names are globally unique)
     step "C6" "Delete S3 bucket — ${BUCKET_NAME}"
     if aws s3api head-bucket --bucket "${BUCKET_NAME}" --region "${AWS_REGION}" 2>/dev/null; then
-        info "Emptying bucket..."
-        aws s3 rm "s3://${BUCKET_NAME}" --recursive \
-            --region "${AWS_REGION}" --no-cli-pager --quiet 2>/dev/null || true
-        aws s3api delete-bucket \
-            --bucket "${BUCKET_NAME}" \
-            --region "${AWS_REGION}" \
-            --no-cli-pager
-        success "S3 bucket deleted: ${BUCKET_NAME}"
-        ((DELETED++)) || true
+        echo ""
+        echo -e "  ${YELLOW}S3 bucket names are globally unique.${NC}"
+        echo -e "  Deleting ${BOLD}${BUCKET_NAME}${NC} means the name may be taken by someone else."
+        echo -e "  Keeping it avoids re-uploading documents on the next setup run."
+        echo ""
+        local delete_s3="n"
+        if [[ -t 0 ]]; then
+            read -r -p "  Delete S3 bucket and all its contents? [y/N] " delete_s3
+        else
+            info "Non-interactive mode — skipping S3 bucket deletion (use S3 console to delete manually)"
+        fi
+        if [[ "${delete_s3}" =~ ^[Yy]$ ]]; then
+            info "Emptying bucket..."
+            aws s3 rm "s3://${BUCKET_NAME}" --recursive \
+                --region "${AWS_REGION}" --no-cli-pager --quiet 2>/dev/null || true
+            aws s3api delete-bucket \
+                --bucket "${BUCKET_NAME}" \
+                --region "${AWS_REGION}" \
+                --no-cli-pager
+            success "S3 bucket deleted: ${BUCKET_NAME}"
+            ((DELETED++)) || true
+        else
+            skip "Keeping S3 bucket: ${BUCKET_NAME}"
+        fi
     else
         skip "S3 bucket ${BUCKET_NAME} not found"
     fi
@@ -1419,16 +1542,19 @@ main() {
     # ── Phase 1: Infrastructure ──
     header "Phase 1: Infrastructure Setup"
     create_s3_bucket
-    upload_documents
+    create_lambda_iam_role          # Must exist before neural search (ML connector references role ARN)
     create_opensearch_serverless
     setup_neural_search
     create_dynamodb_table
 
     # ── Phase 2: Processing Pipeline ──
     header "Phase 2: Document Processing Pipeline"
-    create_lambda_iam_role
     create_lambda_function
     configure_s3_trigger
+
+    # ── Phase 3: Ingest Documents (trigger fires as each doc lands) ──
+    header "Phase 3: Document Ingestion"
+    upload_documents
     test_pipeline
 
     # Summary

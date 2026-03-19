@@ -1,0 +1,48 @@
+[project]
+name = "demo-1-legal-research-rag"
+requires-python = ">=3.13"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # ── Structure ──────────────────────────────────────────────
+    "INP001",  # Implicit namespace package — these are standalone scripts, not packages
+    "D",       # pydocstyle — demo scripts don't need full docstring enforcement
+    "ANN",     # flake8-annotations — type annotations not required for demo scripts
+    "T20",     # flake8-print — print() is intentional in CLI scripts
+    "S",       # flake8-bandit — security linting overkill for local demo scripts
+    "FBT",     # flake8-boolean-trap — boolean args are fine in utility functions
+    "ERA",     # eradicate — commented-out code is sometimes useful in demos
+    "TD",      # flake8-todos — TODOs are fine in demo code
+    "FIX",     # flake8-fixme — same as above
+
+    # ── Style preferences ──────────────────────────────────────
+    "COM812",  # missing trailing comma — conflicts with ruff formatter
+    "ISC001",  # implicit string concat — conflicts with ruff formatter
+    "EM",      # flake8-errmsg — string literals in exceptions are fine for demos
+    "TRY003",  # raise-vanilla-args — same reason
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Lambda handler has required signature (context), deferred imports, and broad exception
+# catches that are intentional for resilience in production Lambda functions
+"lambda_processing/document_processor.py" = [
+    "ARG001",   # unused function argument (Lambda `context`)
+    "PLC0415",  # import not at top level (deferred opensearchpy — not available locally)
+    "BLE001",   # blind exception catch (intentional — Lambda must not crash on single chunk)
+    "C901",     # too complex (semantic_chunk is inherently complex)
+    "PLR0912",  # too many branches (same function)
+    "DTZ007",   # naive datetime in strptime — only used for date format normalization, not timekeeping
+]
+# Data generation script contains long prose strings (legal document content)
+"synth_data/generate_legal_docs.py" = [
+    "E501",     # line too long — string literals contain legal prose, not worth breaking up
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

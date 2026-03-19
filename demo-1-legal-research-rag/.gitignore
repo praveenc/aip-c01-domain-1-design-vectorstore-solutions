@@ -1,0 +1,5 @@
+# Python virtual environment (created by scripts/setup-aws-infra.sh)
+scripts/.venv/
+
+# Runtime artifacts
+scripts/setup.log
